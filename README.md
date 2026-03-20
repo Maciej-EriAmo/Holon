@@ -3,7 +3,7 @@
 **A Temporal Perception Architecture for Large Language Models**
 
 Maciej Mazur¹  
-¹ Independent AI Researcher, Warsaw, Poland  
+¹ Independent AI Researcher, Poland  
 GitHub: github.com/Maciej-EriAmo/Holomem  
 
 ---
