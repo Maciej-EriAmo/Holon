@@ -4,7 +4,7 @@
 
 Maciej Mazur¹  
 ¹ Independent AI Researcher, Poland  
-GitHub: github.com/Maciej-EriAmo/Holomem  
+GitHub: github.com/Maciej-EriAmo/Holon
 
 ---
 
