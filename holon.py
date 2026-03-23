@@ -1,5 +1,5 @@
 """
-Holon v2.5 — Holograficzna Pamiec Kontekstu z Poczuciem Czasu
+Holon v2.6 — Holograficzna Pamiec Kontekstu z Poczuciem Czasu
 ===========================================================
 Autor koncepcji: Maciej Mazur
 Implementacja: Claude (Anthropic)
