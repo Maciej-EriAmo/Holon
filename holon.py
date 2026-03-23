@@ -12,7 +12,8 @@ Architektura:
   TimeDecay       — Φ ewoluuje gdy system jest zamknięty
 
 Wymagania:
-  pip install numpy google-genai
+  pip install numpy
+  (opcjonalnie google-genai do chatu przez Gemini)
 """
 
 import os
@@ -21,9 +22,10 @@ import math
 import time
 import uuid
 import numpy as np
-from typing import Optional
+from typing import Optional, Any
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
+from kurz import KuRz as _KuRz
 
 
 # ============================================================
@@ -38,7 +40,7 @@ class Config:
     lr:           float = 0.01   # learning rate Φ
     alpha:        float = 0.05   # siła hologramu w attention
     top_n_recall: int   = 2      # ile itemów przywołuje recall
-    dim:          int   = 768    # wymiar embeddingów (gemini-embedding-001)
+    dim:          int   = 256    # wymiar embeddingów (KuRz offline)
 
     # Tempo zaniku wierszy Φ [godziny do utraty 50% siły]
     # wiersz 0: wzorzec techniczny/kod    → wolny zanik
@@ -91,53 +93,46 @@ class Item:
 # ============================================================
 
 class Embedder:
-    """Prawdziwy embedder przez Gemini API lub hash fallback."""
+    """
+    KuRz — cichy offline embedder z co-occurrence learning.
+    Uczy sie semantyki z kazdego encode() bez zadnego API.
+    Phi tworzy geometrie percepcji, KuRz jest sorterem slow.
 
-    def __init__(self, api_key: Optional[str] = None, dim: int = 768):
+    Parametry:
+        dim         — przestrzen embeddingu (default 256, mniejsze = szybsze)
+        dict_path   — persystencja slownika miedzy sesjami
+    """
+
+    def __init__(self, api_key: Optional[str] = None, dim: int = 256,
+                 dict_path: Optional[str] = None):
+        # api_key ignorowany — KuRz nie uzywa zewnetrznych API
         self.dim = dim
-        self._client = None
-        key = api_key or os.environ.get("GEMINI_API_KEY")
-        if key:
-            from google import genai
-            self._client = genai.Client(api_key=key)
-            print(f"Embedder: gemini-embedding-001 (dim={dim})")
-        else:
-            print(f"Embedder: hash fallback (dim={dim}) — brak GEMINI_API_KEY")
+        self._kurz = _KuRz(dim=dim, dict_path=dict_path)
+        print(f"Embedder: KuRz offline (dim={dim}, vocab={self._kurz.vocab_size})")
 
     def encode(self, text: str) -> np.ndarray:
-        if self._client:
-            try:
-                from google.genai import types
-                result = self._client.models.embed_content(
-                    model="gemini-embedding-001",
-                    contents=text,
-                    config=types.EmbedContentConfig(
-                        task_type="SEMANTIC_SIMILARITY",
-                        output_dimensionality=self.dim,
-                    ),
-                )
-                vec = np.array(result.embeddings[0].values, dtype=np.float32)
-                return self._normalize(vec)
-            except Exception as e:
-                print(f"[Embedder] Błąd API: {e} — fallback")
+        return self._kurz.encode(text)
 
-        return self._hash_embed(text)
+    def save(self, path: Optional[str] = None) -> None:
+        """Zapisz slownik KuRz (co-occurrence + word→axis)."""
+        if path:
+            self._kurz.save_dict(path)
+        elif self._kurz.dict_path:
+            self._kurz.save_dict()
 
-    def _hash_embed(self, text: str) -> np.ndarray:
-        vec = np.zeros(self.dim, dtype=np.float32)
-        for word in text.lower().split():
-            h = abs(hash(word)) % self.dim
-            vec[h] += 1.0
-        return self._normalize(vec)
+    @property
+    def vocab_size(self) -> int:
+        return self._kurz.vocab_size
+
+    @property
+    def calls(self) -> int:
+        return self._kurz.calls
 
     def _normalize(self, v: np.ndarray) -> np.ndarray:
         norm = np.linalg.norm(v)
         return v / (norm + 1e-8)
 
 
-# ============================================================
-# TIME DECAY — poczucie czasu
-# ============================================================
 
 class TimeDecay:
     """
@@ -369,8 +364,11 @@ class HoloMem:
     # START SESJI
     # -----------------------------------------------------------------------
 
-    def start_session(self) -> str:
-        """Wczytaj pamięć długotrwałą. Zwraca komunikat powitalny."""
+    def start_session(self) -> dict:
+        """
+        Wczytaj pamiec dlugoterwala.
+        Zwraca dict: loaded, delta_hours, wake (komunikat powitalny).
+        """
         result = self.memory.load(self.cfg)
 
         self.phi          = result["phi"]
@@ -379,16 +377,22 @@ class HoloMem:
         self._delta_hours = result["delta_hours"]
         self._loaded      = result["loaded"]
 
-        msg = TimeDecay.wake_message(
+        wake = TimeDecay.wake_message(
             self._delta_hours, self.turns, len(self.store)
         )
-        return msg
+        return {
+            "loaded":      self._loaded,
+            "delta_hours": self._delta_hours,
+            "turns":       self.turns,
+            "store_size":  len(self.store),
+            "wake":        wake,
+        }
 
     # -----------------------------------------------------------------------
     # GŁÓWNY CYKL TURNU
     # -----------------------------------------------------------------------
 
-    def turn(self, user_message: str, system_prompt: str = "") -> list:
+    def turn(self, user_message: str, system_prompt: str = "") -> list[dict]:
         """
         Jeden turn. Zwraca listę messages gotową do wysłania do LLM.
 
@@ -449,7 +453,7 @@ class HoloMem:
         # Zbuduj messages
         return self._build_messages(window, user_message, system_prompt, query_emb)
 
-    def after_turn(self, user_message: str, response: str):
+    def after_turn(self, user_message: str, response: str) -> None:
         """
         Wywołaj po otrzymaniu odpowiedzi od LLM.
         Zapisuje odpowiedź do store, ocenia jakość, aktualizuje pamięć.
@@ -505,8 +509,10 @@ class HoloMem:
         for it in self.store:
             it.age += 1
 
-        # Zapisz pamięć
+        # Zapisz pamięć Phi + KuRz
         self.memory.save(self.phi, self.store, self.turns)
+        if hasattr(self.embedder, 'save'):
+            self.embedder.save()
 
     # -----------------------------------------------------------------------
     # HOLOMEM LOGIC
@@ -563,4 +569,338 @@ class HoloMem:
         tau    = self.cfg.vacuum_age_tau
 
         for item in self.store:
-            semantic = s
+            semantic = self._cosine_sim(item.emb_np(), center)
+            # Łączymy semantykę z quality_weight — nie nadpisujemy feedbacku
+            # Blend: semantyka + feedback jakości z after_turn
+            # Dla nowych itemów (age<=1) relevance=1.0 → blend zachowuje jakość
+            item.relevance = 0.6 * semantic + 0.4 * item.relevance
+
+        def _score(item):
+            # Degradacja relevance przez wiek — stare losowo podobne znikają
+            time_weight = math.exp(-item.age / (tau + 1e-8))
+            return item.relevance * time_weight
+
+        self.store = [
+            item for item in self.store
+            if item.age <= 1
+            or item.recalled
+            or _score(item) >= self.cfg.threshold
+        ]
+        # Hard cap — store nie może rosnąć bez kontroli
+        MAX_STORE = self.cfg.n * 6  # max 6x rozmiar okna
+        if len(self.store) > MAX_STORE:
+            # Zachowaj najnowsze i najważniejsze
+            center = self._phi_center()
+            self.store.sort(
+                key=lambda i: (i.age <= 1, _score(i)),
+                reverse=True
+            )
+            self.store = self.store[:MAX_STORE]
+
+    def _build_window(self, query_emb: np.ndarray = None) -> list:
+        center = self._phi_center(query_emb)
+        protected  = [i for i in self.store if i.age <= 1 or i.recalled]
+        candidates = sorted(
+            [i for i in self.store if i.age > 1 and not i.recalled],
+            key=lambda x: -self._cosine_sim(x.emb_np(), center)
+        )
+        ordered  = protected + candidates
+        selected = ordered[:self.cfg.n]
+
+        # Edge case: uzupełnij do n (id() zamiast __eq__ — efektywne)
+        if len(selected) < self.cfg.n:
+            sel_ids = {id(i) for i in selected}
+            rest    = [i for i in self.store if id(i) not in sel_ids]
+            selected += rest[:self.cfg.n - len(selected)]
+
+        return selected
+
+    def _update_phi(self, window: list):
+        if not window:
+            return
+
+        window_ids = {id(item) for item in window}
+        active_embs = np.array([
+            item.emb_np() for item in self.store
+            if item.age <= 1 or item.recalled or id(item) in window_ids
+        ], dtype=np.float32)
+
+        if len(active_embs) == 0:
+            return
+
+        # Interferencja: konstruktywna (recalled/nowe) + destruktywna (stare tło)
+        # phase = exp(-age/tau) — siła fazy maleje z wiekiem
+        tau     = self.cfg.vacuum_age_tau
+        pattern = np.zeros(active_embs.shape[1], dtype=np.float32)
+        active_items = [
+            item for item in self.store
+            if id(item) in window_ids or item.age <= 1 or item.recalled
+        ]
+        for item, emb in zip(active_items, active_embs):
+            phase = math.exp(-item.age / (tau + 1e-8))
+            if item.recalled:
+                sign   = 1.0    # konstruktywna — reaktywowane wzorce wzmacniają
+                weight = 2.0
+            elif item.age <= 1:
+                sign   = 1.0    # konstruktywne — nowe informacje
+                weight = 1.5
+            else:
+                sign   = -0.3   # lekko destruktywne — stare tło tłumione
+                weight = 1.0
+            pattern += sign * phase * weight * emb
+
+        # Soft normalization — zachowuje kierunek bez brutalnej saturacji tanh
+        # pattern / (1 + ||pattern||) zamiast tanh — nie ścina informacji
+        p_norm  = np.linalg.norm(pattern)
+        pattern = pattern / (1.0 + p_norm)
+        norm    = np.linalg.norm(pattern)
+        pattern = pattern / (norm + 1e-8)
+
+        norms   = np.linalg.norm(self.phi, axis=1)
+        # phi[0] = rdzeń osobowości — aktualizuje się 10x wolniej
+        norms_adj       = norms.copy()
+        norms_adj[0]   *= 10.0  # sztuczne zawyżenie normy → rzadziej wybierany
+        weakest = int(np.argmin(norms_adj))
+        lr_eff  = self.cfg.lr * (0.1 if weakest == 0 else 1.0)
+        updated = (1 - lr_eff) * self.phi[weakest] + lr_eff * pattern
+        norm    = np.linalg.norm(updated)
+        self.phi[weakest] = updated / (norm + 1e-8)
+
+        # Ortogonalizacja Φ — wymusza specjalizację wierszy
+        # Każdy wiersz odpycha się od pozostałych
+        beta = self.cfg.phi_ortho_beta
+        if beta > 0.0:
+            phi_new = self.phi.copy()
+            for i in range(len(self.phi)):
+                row = self.phi[i].copy()
+                for j in range(len(self.phi)):
+                    if i != j:
+                        # Odejmij składową równoległą do phi[j]
+                        row -= beta * float(np.dot(row, self.phi[j])) * self.phi[j]
+                norm = np.linalg.norm(row)
+                phi_new[i] = row / (norm + 1e-8)
+            self.phi = phi_new
+
+    def _build_messages(self, window: list, user_message: str,
+                        system_prompt: str,
+                        query_emb: np.ndarray = None) -> list:
+        messages = []
+
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+
+        # Φ używane TYLKO do selekcji — nie wstrzykujemy nic do promptu
+        # (phi_hint usunięty: 32 floaty = ~200 tokenów kosztu bez wartości dla LLM)
+
+        if window:
+            mem_parts = [
+                f"[t-{item.age}{'*' if item.recalled else ''}] {item.content[:100]}"
+                for item in window
+                if item.content != user_message
+            ]
+            if mem_parts:
+                # Token budget: model_limit=4096, rezerwujemy 512 na odpowiedź,
+                # 256 na system prompt, 512 na query → max 2816 tokenów na pamięć
+                # Heurystyka polska: 1 token ≈ 3.5 znaku (polskie słowa dłuższe)
+                TOKEN_BUDGET  = 2816
+                CHARS_BUDGET  = int(TOKEN_BUDGET * 3.5)  # ~9856 znaków
+                # Dodatkowo hard cap per item — nie pozwól jednemu itemowi zająć wszystko
+                MAX_ITEM_CHARS = 300
+
+                trimmed = []
+                used = 0
+                for part in mem_parts:
+                    part = part[:MAX_ITEM_CHARS]
+                    if used + len(part) > CHARS_BUDGET:
+                        break
+                    trimmed.append(part)
+                    used += len(part)
+
+                if trimmed:
+                    messages.append({
+                        "role":    "system",
+                        "content": "Kontekst sesji:\n" + "\n".join(trimmed),
+                    })
+
+        messages.append({"role": "user", "content": user_message})
+        return messages
+
+    # -----------------------------------------------------------------------
+    # STATYSTYKI
+    # -----------------------------------------------------------------------
+
+    def stats(self) -> dict[str, Any]:
+        center = self._phi_center()
+        avg_rel = float(np.mean([
+            self._cosine_sim(i.emb_np(), center) for i in self.store
+        ])) if self.store else 0.0
+
+        phi_norms = np.linalg.norm(self.phi, axis=1).tolist()
+
+        return {
+            "turns":       self.turns,
+            "store_size":  len(self.store),
+            "avg_rel":     round(avg_rel, 4),
+            "phi_norms":   [round(n, 4) for n in phi_norms],
+            "delta_hours": round(self._delta_hours, 2),
+            "memory_file": str(self.memory.path),
+            "memory_saved": self.memory.exists(),
+        }
+
+    def reset(self):
+        self.memory.delete()
+        self.phi   = PersistentMemory._init_phi(self.cfg)
+        self.store = []
+        self.turns = 0
+        self._delta_hours = 0.0
+
+
+# ============================================================
+# SESJA INTERAKTYWNA
+# ============================================================
+
+class Session:
+    """
+    Wrapper łączący HoloMem z wywołaniem LLM.
+    Działa z dowolnym dostawcą OpenAI-compatible API.
+    """
+
+    DEFAULT_SYSTEM = (
+        "Jesteś pomocnym asystentem. "
+        "Odpowiadaj w języku rozmówcy. Domyślnie po polsku."
+    )
+
+    def __init__(
+        self,
+        memory_path:  str    = "holon_memory.json",
+        cfg:          Config = None,
+        system:       str    = None,
+        model:        str    = "gemini-2.5-flash",
+    ):
+        self.model  = model
+        self.system = system or self.DEFAULT_SYSTEM
+        self._gemini_key = os.environ.get("GEMINI_API_KEY", "")
+
+        emb = Embedder(
+            api_key=self._gemini_key,
+            dim=(cfg or Config()).dim
+        )
+        self.holomem = HoloMem(emb, cfg or Config(), memory_path)
+        self._gemini_client = None
+        if self._gemini_key:
+            from google import genai
+            self._gemini_client = genai.Client(api_key=self._gemini_key)
+
+    def start(self) -> str:
+        result = self.holomem.start_session()
+        s      = self.holomem.stats()
+        print(f"\n[Holon] turns={s['turns']} store={s['store_size']} "
+              f"rel={s['avg_rel']} delta={s['delta_hours']}h")
+        return result.get("wake", "")
+
+    def chat(self, user_input: str) -> str:
+        messages = self.holomem.turn(user_input, self.system)
+        response = self._call_llm(messages)
+        self.holomem.after_turn(user_input, response)
+        self._embedder.save()
+        s = self.holomem.stats()
+        print(f"  [store={s['store_size']} rel={s['avg_rel']}]", flush=True)
+        return response
+
+    def _call_llm(self, messages: list) -> str:
+        if not self._gemini_client:
+            return "[Błąd: brak GEMINI_API_KEY]"
+        try:
+            from google.genai import types
+
+            # Konwertuj messages na format Gemini
+            # system → system_instruction, reszta → contents
+            system_parts = []
+            contents     = []
+
+            for msg in messages:
+                role    = msg["role"]
+                content = msg["content"]
+                if role == "system":
+                    system_parts.append(content)
+                elif role == "user":
+                    contents.append(types.Content(
+                        role="user",
+                        parts=[types.Part(text=content)]
+                    ))
+                elif role == "assistant":
+                    contents.append(types.Content(
+                        role="model",
+                        parts=[types.Part(text=content)]
+                    ))
+
+            system_instruction = "\n".join(system_parts) if system_parts else None
+
+            response = self._gemini_client.models.generate_content(
+                model   = self.model,
+                contents = contents,
+                config  = types.GenerateContentConfig(
+                    system_instruction = system_instruction,
+                    max_output_tokens  = 1024,
+                    temperature        = 0.7,
+                )
+            )
+            return response.text
+        except Exception as e:
+            return f"[Błąd LLM: {e}]"
+
+    def stats(self) -> dict[str, Any]:
+        return self.holomem.stats()
+
+    def reset(self):
+        self.holomem.reset()
+        print("[HoloMem] Pamięć wyczyszczona.")
+
+
+# ============================================================
+# URUCHOMIENIE
+# ============================================================
+
+if __name__ == "__main__":
+    import sys
+
+    print("=" * 60)
+    print("Holon v2.5 — Holograficzna Pamiec Kontekstu z Poczuciem Czasu")
+    print("=" * 60)
+
+    session = Session(
+        memory_path = "holon_memory.json",
+        model       = "gemini-2.5-flash",
+    )
+
+    wake = session.start()
+    if wake:
+        print(f"\n{wake}\n")
+
+    print("Wpisz 'quit' aby wyjść, 'stats' dla statystyk, 'reset' aby wyczyścić.")
+    print("-" * 60)
+
+    while True:
+        try:
+            user = input("\nTy: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nDo widzenia.")
+            break
+
+        if not user:
+            continue
+        if user.lower() == "quit":
+            break
+        if user.lower() == "stats":
+            s = session.stats()
+            print(f"\n[Stats] turns={s['turns']} store={s['store_size']} "
+                  f"rel={s['avg_rel']} phi_norms={s['phi_norms']} "
+                  f"delta={s['delta_hours']}h saved={s['memory_saved']}")
+            continue
+        if user.lower() == "reset":
+            session.reset()
+            continue
+
+        print("\nAsystent: ", end="", flush=True)
+        response = session.chat(user)
+        print(response)
