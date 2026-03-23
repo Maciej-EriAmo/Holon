@@ -1,5 +1,5 @@
 """
-Holon v2.6 — Holograficzna Pamiec Kontekstu z Poczuciem Czasu
+Holon v2.7 — Holograficzna Pamiec Kontekstu z Poczuciem Czasu
 ===========================================================
 Autor koncepcji: Maciej Mazur
 Implementacja: Claude (Anthropic)
@@ -781,15 +781,16 @@ class Session:
         self.system = system or self.DEFAULT_SYSTEM
         self._gemini_key = os.environ.get("GEMINI_API_KEY", "")
 
-        emb = Embedder(
-            api_key=self._gemini_key,
-            dim=(cfg or Config()).dim
-        )
-        self.holomem = HoloMem(emb, cfg or Config(), memory_path)
+        cfg_ = cfg or Config()
+        emb  = Embedder(dim=cfg_.dim, dict_path=memory_path.replace(".json", "_kurz.json"))
+        self.holomem = HoloMem(emb, cfg_, memory_path)
         self._gemini_client = None
         if self._gemini_key:
-            from google import genai
-            self._gemini_client = genai.Client(api_key=self._gemini_key)
+            try:
+                from google import genai
+                self._gemini_client = genai.Client(api_key=self._gemini_key)
+            except Exception:
+                pass
 
     def start(self) -> str:
         result = self.holomem.start_session()
@@ -801,8 +802,7 @@ class Session:
     def chat(self, user_input: str) -> str:
         messages = self.holomem.turn(user_input, self.system)
         response = self._call_llm(messages)
-        self.holomem.after_turn(user_input, response)
-        self._embedder.save()
+        self.holomem.after_turn(user_input, response)  # save() juz w after_turn
         s = self.holomem.stats()
         print(f"  [store={s['store_size']} rel={s['avg_rel']}]", flush=True)
         return response
