@@ -1,8 +1,7 @@
 """
-Holon v5.5 — Full Predictive Coding + Asystent z przypomnieniami + Trwałe fakty
+Holon v5.6 — Full Predictive Coding + Asystent z przypomnieniami + Trwałe fakty
 ===========================================================================
 Autor koncepcji: Maciej Mazur
-Implementacja: Claude (Anthropic) + Grok
 ===========================================================================
 POPRAWKI v5.4 (relative to Grok's version):
 [R1] recall_at — przywrócono +hours_ago (cofnięta regresja FIX-5)
@@ -138,6 +137,7 @@ class Item:
     cluster_size:  int   = 1
     is_reminder:   bool  = False
     is_fact:       bool  = False
+    is_work:       bool  = False   # praca nad projektem — chronione jak fakt
     _norm:         float = field(default=-1.0, repr=False)
 
     def emb_np(self) -> np.ndarray:
@@ -489,6 +489,7 @@ class PersistentMemory:
                     "created_at":  i.created_at,
                     "is_reminder": i.is_reminder,
                     "is_fact":     i.is_fact,
+                    "is_work":     i.is_work,
                 }
                 for i in store if i.age >= 1
             ],
@@ -575,7 +576,8 @@ class PersistentMemory:
                         age=age_now, recalled=False, relevance=obj["relevance"],
                         created_at=obj.get("created_at", time.time()),
                         is_reminder=obj.get("is_reminder", False),
-                        is_fact=obj.get("is_fact", False)))
+                        is_fact=obj.get("is_fact", False),
+                        is_work=obj.get("is_work", False)))
             else:
                 print(f"[Memory] Utrata koherencji ({coherence:.2f}). Depolaryzacja.")
 
@@ -604,10 +606,25 @@ class PersistentMemory:
 # ============================================================
 
 class HoloMem:
-    # [R4] Stała klasowa — jedna lista wzorców faktów, używana w turn() i after_turn()
+    # [R4] Deklaracje osobiste — traktuję jako is_fact
     FACT_PATTERNS: Tuple[str, ...] = (
         "mój ulubiony", "jestem", "mam na imię", "nazywam się",
         "lubię", "pracuję nad",
+    )
+
+    # Słowa kluczowe aktywnej pracy nad projektami — traktuję jako is_work.
+    # Rozszerzone o konkretne projekty Macieja + generyczne terminy programistyczne.
+    # Focus wykrywany też przez AIIState.focus_active (neural cosine similarity).
+    FOCUS_PATTERNS: Tuple[str, ...] = (
+        # Projekty
+        "holon", "holomem", "eriamo", "kurz", "harmonic attention",
+        "adml", "archmind", "fehm", "qrm", "bielik", "speakleash",
+        # Generyczne terminy pracy nad kodem
+        "implementuję", "implementacja", "debuguję", "refaktoruję",
+        "klasa ", "metoda ", "funkcja ", "def ", "class ",
+        "algorytm", "architektura", "moduł", "integracja",
+        "trenuję", "fine-tuning", "embedding", "transformer",
+        "naprawiam", "poprawka", "błąd w", "fix:",
     )
 
     def __init__(self, embedder: Embedder, cfg: Config = None,
@@ -711,6 +728,9 @@ class HoloMem:
                 if item.is_fact:
                     # [B7] Wiek-zależna premia — nowe fakty ważniejsze, stare nie dominują zawsze
                     score *= (1.0 + 0.2 / (1.0 + item.age * 0.1))
+                if item.is_work:
+                    # Aktywna praca nad projektem: wyższy boost, wolniej maleje z wiekiem
+                    score *= (1.0 + 0.4 / (1.0 + item.age * 0.05))
                 if id(item) not in scores or score > scores[id(item)][0]:
                     scores[id(item)] = (score, item, k)
         ranked = sorted(scores.values(), key=lambda x: -x[0])
@@ -753,11 +773,11 @@ class HoloMem:
             fe = energy + entropy
             return -(fe - 0.2 * item.relevance)
 
-        # Fakty chronione przed usunięciem
+        # Fakty i praca nad projektami chronione przed usunięciem
         # [B6] Dodano i.relevance > 0.3 — stabilizuje pamięć przy niestabilnym threshold (AII)
         self.store = [i for i in self.store
                       if (i.age <= 1 and i.relevance > 0.2) or i.recalled
-                      or i.is_fact or i.relevance > 0.3 or _score(i) >= threshold]
+                      or i.is_fact or i.is_work or i.relevance > 0.3 or _score(i) >= threshold]
 
         # [R3] Używamy pól Config zamiast getattr fallback
         hpi = self.cfg.hard_prune_interval
@@ -1001,8 +1021,8 @@ class HoloMem:
         center   = self._phi_center(query_emb, level=2)
         cdim     = self.cfg.dim
         center_c = center[:cdim] / (np.linalg.norm(center[:cdim]) + 1e-8)
-        # [B2] Fakty zawsze chronione w oknie — niezależnie od age/recall
-        protected     = [i for i in self.store if i.age <= 1 or i.recalled or i.is_fact]
+        # Fakty i praca nad projektami zawsze w oknie
+        protected     = [i for i in self.store if i.age <= 1 or i.recalled or i.is_fact or i.is_work]
         protected_ids = {id(i) for i in protected}
         candidates    = sorted(
             [i for i in self.store if id(i) not in protected_ids],
@@ -1014,15 +1034,21 @@ class HoloMem:
         msgs = [{"role": "system", "content": system_prompt}] if system_prompt else []
         if window:
             ctx = [i for i in window if i.content != user_message]
-            # [B3] Rozdziel fakty od zwykłego kontekstu — LLM musi wiedzieć co jest faktem
-            facts   = [i for i in ctx if i.is_fact]
-            regular = [i for i in ctx if not i.is_fact]
-            mem_parts = []
-            if facts:
-                # Fakty idą na górę jako sekcja wyróżniona — model traktuje je jako PEWNĄ WIEDZĘ
-                fact_lines = [f"• {i.content[:300]}" for i in facts]
-                mem_parts.append("TRWAŁE FAKTY (zawsze prawdziwe — nie mów że nie wiesz):\n"
-                                  + "\n".join(fact_lines))
+            # Trzy sekcje w kolejności priorytetu: projekty → fakty → kontekst
+            work_items = [i for i in ctx if i.is_work]
+            fact_items = [i for i in ctx if i.is_fact and not i.is_work]
+            regular    = [i for i in ctx if not i.is_fact and not i.is_work]
+            mem_parts  = []
+            if work_items:
+                work_lines = [f"• {i.content[:400]}" for i in work_items]
+                mem_parts.append(
+                    "AKTYWNE PROJEKTY (najwyższy priorytet — to nad czym pracujemy):\n"
+                    + "\n".join(work_lines))
+            if fact_items:
+                fact_lines = [f"• {i.content[:300]}" for i in fact_items]
+                mem_parts.append(
+                    "TRWAŁE FAKTY (zawsze prawdziwe — nie mów że nie wiesz):\n"
+                    + "\n".join(fact_lines))
             if regular:
                 max_chars = max(200, 9856 // max(1, len(regular)))
                 reg_lines = [f"[t-{i.age}{'★' if i.recalled else ''}] {i.content[:max_chars]}"
@@ -1080,10 +1106,13 @@ class HoloMem:
                 sim = self._csim(q_timed, i.emb_np())
                 if sim > best_sim:
                     best_sim, best_item = sim, i
-            # [R4] Używamy FACT_PATTERNS — spójne z after_turn()
+            # Nie scalaj jeśli to fakt lub praca nad projektem
             is_new_fact = (any(p in user_message.lower() for p in self.FACT_PATTERNS)
                            and "?" not in user_message)
-            if best_sim > 0.95 and not best_item.is_fact and not is_new_fact:
+            is_new_work = (self.aii.focus_active or
+                           any(p in user_message.lower() for p in self.FOCUS_PATTERNS))
+            if best_sim > 0.95 and not best_item.is_fact and not best_item.is_work \
+                    and not is_new_fact and not is_new_work:
                 self._semantic_merge(best_item, q_timed)
                 skip = True
 
@@ -1119,23 +1148,29 @@ class HoloMem:
                 sim = self._csim(comb_emb, i.emb_np())
                 if sim > best_sim:
                     best_sim, best_item = sim, i
-            # [R4] Używamy FACT_PATTERNS — spójne z turn()
+            # Nie scalaj jeśli to fakt lub praca nad projektem
             is_new_fact = (any(p in user_message.lower() for p in self.FACT_PATTERNS)
                            and "?" not in user_message)
-            if best_sim > 0.95 and not best_item.is_fact and not is_new_fact:
+            is_new_work = (self.aii.focus_active or
+                           any(p in user_message.lower() for p in self.FOCUS_PATTERNS))
+            if best_sim > 0.95 and not best_item.is_fact and not best_item.is_work \
+                    and not is_new_fact and not is_new_work:
                 self._semantic_merge(best_item, comb_emb)
                 skip = True
 
         if not skip:
-            # Automatyczna detekcja faktów przez FACT_PATTERNS
+            # Detekcja: fakt osobisty lub aktywna praca nad projektem
             is_fact = (any(p in user_message.lower() for p in self.FACT_PATTERNS)
                        and "?" not in user_message)
+            is_work = (self.aii.focus_active or
+                       any(p in user_message.lower() for p in self.FOCUS_PATTERNS))
             self.store.append(Item(
                 id=str(uuid.uuid4()),
                 content=combined[:800],
                 embedding=comb_emb.tolist(),
                 relevance=self.aii.get_emotion_weight(),
-                is_fact=is_fact))
+                is_fact=is_fact,
+                is_work=is_work))
 
         self._vacuum(comb_emb)
         self._update_phi(self._build_window(comb_emb))
